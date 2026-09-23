@@ -1,0 +1,22 @@
+databaseChangeLog:
+  # This ordered release manifest expresses the database object dependency graph.
+  # Customers -> customer addresses -> orders -> reporting view.
+  # Do not reorder entries after a release has been deployed.
+  - include:
+      file: changes/2026-09-21-create-customers.sql
+      relativeToChangelogFile: true
+  - include:
+      file: changes/2026-09-21-create-customer-addresses.sql
+      relativeToChangelogFile: true
+  - include:
+      file: changes/2026-09-21-create-orders.sql
+      relativeToChangelogFile: true
+  - include:
+      file: changes/2026-09-21-create-order-summary-view.sql
+      relativeToChangelogFile: true
+  - include:
+      file: changes/2026-09-22-add-order-source.sql
+      relativeToChangelogFile: true
+  - include:
+      file: changes/2026-09-23-add-order-source-system-2.sql
+      relativeToChangelogFile: true

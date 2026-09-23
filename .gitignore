@@ -1,0 +1,5 @@
+# Autonomous Database client credentials are runtime-only secrets.
+Wallet_*.zip
+.runtime/
+liquibase/liquibase.properties
+*.log

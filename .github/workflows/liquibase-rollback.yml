@@ -1,0 +1,145 @@
+name: Liquibase Autonomous Database Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_tag:
+        description: 'Existing db-release-<number> or pre-db-release-<number> database checkpoint'
+        required: true
+        type: string
+      mode:
+        description: 'Generate a plan, or execute a reviewed rollback'
+        required: true
+        default: preview
+        type: choice
+        options: [preview, execute]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liquibase-autonomous-rollback
+  cancel-in-progress: false
+
+env:
+  CHANGELOG: database/changelog/db.changelog-master.yaml
+  LB_VERSION: '4.32.0'
+  ORACLE_JDBC_BOM_VERSION: '23.4.0.24.05'
+
+jobs:
+  preview:
+    name: Generate rollback plan
+    runs-on: ubuntu-latest
+    environment: autonomous-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LB_VERSION }}
+          edition: community
+      - name: Obtain Oracle wallet security library
+        run: |
+          mkdir -p .runtime/lib
+          cat > .runtime/wallet-pom.xml <<'EOF'
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>demo</groupId><artifactId>adb-wallet-library</artifactId><version>1.0.0</version>
+            <dependencyManagement><dependencies><dependency>
+              <groupId>com.oracle.database.jdbc</groupId><artifactId>ojdbc-bom</artifactId>
+              <version>${env.ORACLE_JDBC_BOM_VERSION}</version><type>pom</type><scope>import</scope>
+            </dependency></dependencies></dependencyManagement>
+            <dependencies><dependency>
+              <groupId>com.oracle.database.security</groupId><artifactId>oraclepki</artifactId>
+            </dependency></dependencies>
+          </project>
+          EOF
+          mvn --batch-mode --quiet --file .runtime/wallet-pom.xml dependency:copy-dependencies \
+            -DoutputDirectory="$GITHUB_WORKSPACE/.runtime/lib" -DincludeScope=runtime
+          test -f .runtime/lib/oraclepki-*.jar
+      - name: Materialize Autonomous Database wallet
+        env:
+          ADB_WALLET_BASE64: ${{ secrets.ADB_WALLET_BASE64 }}
+        run: |
+          test -n "$ADB_WALLET_BASE64"
+          mkdir -p .runtime/wallet
+          printf '%s' "$ADB_WALLET_BASE64" | base64 --decode > .runtime/wallet.zip
+          unzip -q .runtime/wallet.zip -d .runtime/wallet
+      - name: Generate and verify rollback SQL
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+          ROLLBACK_TAG: ${{ inputs.rollback_tag }}
+        run: |
+          [[ "$ROLLBACK_TAG" =~ ^(pre-)?db-release-[1-9][0-9]*$ ]]
+          test -n "$ADB_USERNAME" && test -n "$ADB_PASSWORD" && test -n "$ADB_TNS_ALIAS"
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$ROLLBACK_TAG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase rollback-sql --tag="$ROLLBACK_TAG" \
+            --changelog-file="$CHANGELOG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD" \
+            --output-file=liquibase-rollback.sql
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liquibase-rollback-sql
+          path: liquibase-rollback.sql
+          if-no-files-found: error
+
+  execute:
+    name: Execute reviewed rollback
+    needs: preview
+    if: inputs.mode == 'execute'
+    runs-on: ubuntu-latest
+    environment: autonomous-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LB_VERSION }}
+          edition: community
+      - name: Obtain Oracle wallet security library
+        run: |
+          mkdir -p .runtime/lib
+          cat > .runtime/wallet-pom.xml <<'EOF'
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>demo</groupId><artifactId>adb-wallet-library</artifactId><version>1.0.0</version>
+            <dependencyManagement><dependencies><dependency>
+              <groupId>com.oracle.database.jdbc</groupId><artifactId>ojdbc-bom</artifactId>
+              <version>${env.ORACLE_JDBC_BOM_VERSION}</version><type>pom</type><scope>import</scope>
+            </dependency></dependencies></dependencyManagement>
+            <dependencies><dependency>
+              <groupId>com.oracle.database.security</groupId><artifactId>oraclepki</artifactId>
+            </dependency></dependencies>
+          </project>
+          EOF
+          mvn --batch-mode --quiet --file .runtime/wallet-pom.xml dependency:copy-dependencies \
+            -DoutputDirectory="$GITHUB_WORKSPACE/.runtime/lib" -DincludeScope=runtime
+          test -f .runtime/lib/oraclepki-*.jar
+      - name: Materialize Autonomous Database wallet
+        env:
+          ADB_WALLET_BASE64: ${{ secrets.ADB_WALLET_BASE64 }}
+        run: |
+          test -n "$ADB_WALLET_BASE64"
+          mkdir -p .runtime/wallet
+          printf '%s' "$ADB_WALLET_BASE64" | base64 --decode > .runtime/wallet.zip
+          unzip -q .runtime/wallet.zip -d .runtime/wallet
+      - name: Execute rollback to approved checkpoint
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+          ROLLBACK_TAG: ${{ inputs.rollback_tag }}
+        run: |
+          [[ "$ROLLBACK_TAG" =~ ^(pre-)?db-release-[1-9][0-9]*$ ]]
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$ROLLBACK_TAG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase rollback --tag="$ROLLBACK_TAG" \
+            --changelog-file="$CHANGELOG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD"

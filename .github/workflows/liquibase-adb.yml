@@ -1,0 +1,181 @@
+name: Liquibase Autonomous Database CI/CD
+
+on:
+  pull_request:
+    paths:
+      - 'database/**'
+      - '.github/workflows/liquibase-adb.yml'
+  push:
+    branches: [main, 'release/**']
+    tags: ['db-release-*']
+    paths:
+      - 'database/**'
+      - '.github/workflows/liquibase-adb.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing immutable db-release-<number> tag to deploy'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liquibase-autonomous-demo
+  cancel-in-progress: false
+
+env:
+  CHANGELOG: database/changelog/db.changelog-master.yaml
+  # LIQUIBASE_* names are interpreted by the Liquibase CLI as configuration.
+  LB_VERSION: '4.32.0'
+  OFFLINE_ORACLE_URL: 'offline:oracle?version=26.0'
+  ORACLE_JDBC_BOM_VERSION: '23.4.0.24.05'
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+
+jobs:
+  validate:
+    name: Validate and preview release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A manual promotion checks out the requested immutable tag, not the
+          # default branch on which the workflow was started.
+          ref: ${{ env.RELEASE_REF }}
+      - uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LB_VERSION }}
+          edition: community
+      - name: Validate changelog structure
+        run: liquibase validate --url="$OFFLINE_ORACLE_URL" --changelog-file="$CHANGELOG"
+      - name: Generate Oracle deployment preview
+        run: liquibase update-sql --url="$OFFLINE_ORACLE_URL" --changelog-file="$CHANGELOG" --output-file=liquibase-update.sql
+      - name: Publish SQL preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: liquibase-update-sql
+          path: liquibase-update.sql
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to Autonomous Database
+    needs: validate
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/db-release-')) || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: autonomous-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: liquibase/setup-liquibase@v3
+        with:
+          version: ${{ env.LB_VERSION }}
+          edition: community
+      - name: Obtain Oracle wallet security libraries
+        run: |
+          mkdir -p .runtime/lib
+          cat > .runtime/wallet-pom.xml <<'EOF'
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>demo</groupId><artifactId>adb-wallet-libraries</artifactId><version>1.0.0</version>
+            <dependencyManagement><dependencies><dependency>
+              <groupId>com.oracle.database.jdbc</groupId><artifactId>ojdbc-bom</artifactId>
+              <version>${env.ORACLE_JDBC_BOM_VERSION}</version><type>pom</type><scope>import</scope>
+            </dependency></dependencies></dependencyManagement>
+            <dependencies>
+              <dependency><groupId>com.oracle.database.security</groupId><artifactId>oraclepki</artifactId></dependency>
+            </dependencies>
+          </project>
+          EOF
+          mvn --batch-mode --quiet --file .runtime/wallet-pom.xml dependency:copy-dependencies \
+            -DoutputDirectory="$GITHUB_WORKSPACE/.runtime/lib" -DincludeScope=runtime
+          test -f .runtime/lib/oraclepki-*.jar
+      - name: Materialize Autonomous Database wallet
+        env:
+          ADB_WALLET_BASE64: ${{ secrets.ADB_WALLET_BASE64 }}
+        run: |
+          test -n "$ADB_WALLET_BASE64"
+          mkdir -p .runtime/wallet
+          printf '%s' "$ADB_WALLET_BASE64" | base64 --decode > .runtime/wallet.zip
+          unzip -q .runtime/wallet.zip -d .runtime/wallet
+      - name: Verify immutable release tag
+        run: |
+          [[ "$RELEASE_REF" =~ ^refs/tags/db-release-[1-9][0-9]*$ ]]
+      - name: Validate target and pending changes
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+        run: |
+          test -n "$ADB_USERNAME" && test -n "$ADB_PASSWORD" && test -n "$ADB_TNS_ALIAS"
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase status --verbose \
+            --changelog-file="$CHANGELOG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+      - name: Tag pre-deployment database checkpoint
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+        run: |
+          CHECKPOINT_TAG="pre-${RELEASE_REF#refs/tags/}"
+          TAG_EXISTS_OUTPUT="$(LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$CHECKPOINT_TAG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD" 2>&1)"
+          printf '%s\n' "$TAG_EXISTS_OUTPUT"
+          if grep -Fq "already exists" <<< "$TAG_EXISTS_OUTPUT"; then
+            echo "Database checkpoint $CHECKPOINT_TAG already exists."
+          elif grep -Fq "does NOT exist" <<< "$TAG_EXISTS_OUTPUT"; then
+            LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag --tag="$CHECKPOINT_TAG" \
+              --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+              --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+            TAG_EXISTS_OUTPUT="$(LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$CHECKPOINT_TAG" \
+              --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+              --username="$ADB_USERNAME" --password="$ADB_PASSWORD" 2>&1)"
+            printf '%s\n' "$TAG_EXISTS_OUTPUT"
+            grep -Fq "already exists" <<< "$TAG_EXISTS_OUTPUT"
+          else
+            echo "Unable to determine whether database checkpoint $CHECKPOINT_TAG exists." >&2
+            exit 1
+          fi
+      - name: Apply approved release
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+        run: |
+          LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase update \
+            --changelog-file="$CHANGELOG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+      - name: Tag successful database release
+        env:
+          TNS_ADMIN: ${{ github.workspace }}/.runtime/wallet
+          ADB_USERNAME: ${{ secrets.ADB_USERNAME }}
+          ADB_PASSWORD: ${{ secrets.ADB_PASSWORD }}
+          ADB_TNS_ALIAS: ${{ secrets.ADB_TNS_ALIAS }}
+        run: |
+          RELEASE_TAG="${RELEASE_REF#refs/tags/}"
+          TAG_EXISTS_OUTPUT="$(LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$RELEASE_TAG" \
+            --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+            --username="$ADB_USERNAME" --password="$ADB_PASSWORD" 2>&1)"
+          printf '%s\n' "$TAG_EXISTS_OUTPUT"
+          if grep -Fq "already exists" <<< "$TAG_EXISTS_OUTPUT"; then
+            echo "Database checkpoint $RELEASE_TAG already exists."
+          elif grep -Fq "does NOT exist" <<< "$TAG_EXISTS_OUTPUT"; then
+            LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag --tag="$RELEASE_TAG" \
+              --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+              --username="$ADB_USERNAME" --password="$ADB_PASSWORD"
+            TAG_EXISTS_OUTPUT="$(LIQUIBASE_CLASSPATH="$(printf '%s:' .runtime/lib/*.jar)" liquibase tag-exists --tag="$RELEASE_TAG" \
+              --url="jdbc:oracle:thin:@$ADB_TNS_ALIAS?TNS_ADMIN=$TNS_ADMIN" \
+              --username="$ADB_USERNAME" --password="$ADB_PASSWORD" 2>&1)"
+            printf '%s\n' "$TAG_EXISTS_OUTPUT"
+            grep -Fq "already exists" <<< "$TAG_EXISTS_OUTPUT"
+          else
+            echo "Unable to determine whether database checkpoint $RELEASE_TAG exists." >&2
+            exit 1
+          fi
