@@ -38,12 +38,12 @@ jobs:
     name: Validate and preview release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # A manual promotion checks out the requested immutable tag, not the
           # default branch on which the workflow was started.
           ref: ${{ env.RELEASE_REF }}
-      - uses: liquibase/setup-liquibase@v3
+      - uses: liquibase/setup-liquibase@9bd28bc8b31bd5a1651b34c7856569d5392ee869 # v3
         with:
           version: ${{ env.LB_VERSION }}
           edition: community
@@ -52,7 +52,7 @@ jobs:
       - name: Generate Oracle deployment preview
         run: liquibase update-sql --url="$OFFLINE_ORACLE_URL" --changelog-file="$CHANGELOG" --output-file=liquibase-update.sql
       - name: Publish SQL preview
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: liquibase-update-sql
           path: liquibase-update.sql
@@ -65,10 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: autonomous-production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ env.RELEASE_REF }}
-      - uses: liquibase/setup-liquibase@v3
+      - uses: liquibase/setup-liquibase@9bd28bc8b31bd5a1651b34c7856569d5392ee869 # v3
         with:
           version: ${{ env.LB_VERSION }}
           edition: community

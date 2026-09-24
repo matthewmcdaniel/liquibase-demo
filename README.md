@@ -65,8 +65,8 @@ To promote an existing tag manually, run **Liquibase Autonomous Database CI/CD**
 
 Always generate and review rollback SQL before executing it.
 
-1. In Actions, open **Liquibase Autonomous Database Rollback** and select the release revision being rolled back.
-2. Run with `mode: preview` and the checkpoint immediately before the release, for example `pre-db-release-2`.
+1. In Actions, open **Liquibase Autonomous Database Rollback**.
+2. Run with `release_tag: db-release-2`, `rollback_tag: pre-db-release-2`, and `mode: preview`. The release tag fixes the changelog revision used to generate rollback SQL.
 3. Approve the environment and review the `liquibase-rollback-sql` artifact.
 4. Run again with `mode: execute` and the same checkpoint, then approve the execution.
 
